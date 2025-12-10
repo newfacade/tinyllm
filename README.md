@@ -1,0 +1,2 @@
+# tinyllm
+easy to understand
