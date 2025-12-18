@@ -36,7 +36,7 @@ class MultiHeadAttention(nn.Module):
         v = v.reshape(v.shape[0], v.shape[1], self.n_head, self.head_dim).transpose(1, 2)
         # RoPE 嵌入
         q, k = apply_rope_emb(q, k, freq_cis)
-        # 多头注意力
+        # 多头注意力 [b, n_head, t, t]
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask
@@ -108,5 +108,3 @@ class TransformerModel(nn.Module):
             x = layer(x, freqs_cis, mask)
         # 输出层
         return self.output(self.norm(x))
-
-

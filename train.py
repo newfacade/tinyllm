@@ -1,117 +1,111 @@
+import argparse
 import torch
-from torch.utils.data import DataLoader, TensorDataset
+import tiktoken
 from model import TransformerModel
+from data import tokenizing_distributed_data_loader, get_dist_info
 
 
-def train(model, dataloader, optimizer, criterion, device, epochs=1):
+def train_one_epoch(model, batch_iter, optimizer, criterion, device):
+    """
+    预训练单个 epoch：遍历一次（有限）数据迭代器。
+    - batch_iter: 一个有限迭代器，yield (inputs, targets)，形状均为 [B, T]。
+    """
+    ddp, ddp_rank, _, _ = get_dist_info()
     model.train()
-    for epoch in range(epochs):
-        for batch in dataloader:
-            tokens, labels = batch
-            tokens, labels = tokens.to(device), labels.to(device)
-            # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-            optimizer.zero_grad()
-            # forward
-            outputs = model(tokens)
-            # 注意：nn.CrossEntropyLoss 期望输入为 (batch_size, num_classes)，而输出为 (batch_size, seq_len, num_classes)
-            # 因此，我们需要将输出的最后一个维度进行 flatten
-            # criterion = torch.nn.CrossEntropyLoss()
-            loss = criterion(outputs.view(-1, outputs.size(-1)), labels.view(-1))
-            loss.backward()
-            optimizer.step()
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item()}")
+    last_loss = None
+    for inputs, targets in batch_iter:
+        # 确保与模型设备一致（若迭代器已在目标设备，此操作为 no-op）
+        inputs = inputs.to(device)
+        targets = targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        # nn.CrossEntropyLoss 期望输入为 (N, C)
+        loss = criterion(outputs.view(-1, outputs.size(-1)), targets.view(-1))
+        loss.backward()
+        optimizer.step()
+        last_loss = loss.item()
+    if (not ddp) or (ddp_rank == 0):
+        print(f"Epoch done, Last Loss: {last_loss}")
 
 
-# 简单字符级 tokenizer（含特殊符号）
-class CharTokenizer:
-    def __init__(self, corpus):
-        # 特殊符号
-        self.pad_token = '<pad>'
-        self.bos_token = '<bos>'
-        self.eos_token = '<eos>'
-        specials = [self.pad_token, self.bos_token, self.eos_token]
-        # 收集字符集
-        charset = set()
-        for text in corpus:
-            charset.update(list(text))
-        # 构建词表
-        self.itos = specials + sorted(list(charset))
-        self.stoi = {ch: i for i, ch in enumerate(self.itos)}
-        self.pad_id = self.stoi[self.pad_token]
-        self.bos_id = self.stoi[self.bos_token]
-        self.eos_id = self.stoi[self.eos_token]
-
-    @property
-    def vocab_size(self):
-        return len(self.itos)
-
-    def encode(self, text: str):
-        ids = [self.bos_id]
-        ids.extend(self.stoi[ch] for ch in text)
-        ids.append(self.eos_id)
-        return ids
-
-    def decode(self, ids):
-        return ''.join(self.itos[i] for i in ids if i >= 0 and i < len(self.itos))
-
-
-def build_dataloader(corpus, tokenizer: CharTokenizer, block_size=64, batch_size=8):
-    # 将所有文本编码并拼接为一个连续令牌流
-    stream = []
-    for text in corpus:
-        stream.extend(tokenizer.encode(text))
-    # 构造不重叠的训练片段，每个片段长度为 block_size+1（用于右移标签）
-    tokens_list, labels_list = [], []
-    for i in range(0, len(stream) - (block_size + 1) + 1, block_size):
-        chunk = stream[i : i + block_size + 1]
-        tokens = chunk[:-1]  # 模型输入
-        labels = chunk[1:]   # 预测目标（右移一位）
-        tokens_list.append(tokens)
-        labels_list.append(labels)
-    if not tokens_list:
-        raise ValueError("语料过短，无法构造训练样本；请增大语料或减小 block_size。")
-    # 张量化
-    tokens_tensor = torch.tensor(tokens_list, dtype=torch.long)
-    labels_tensor = torch.tensor(labels_list, dtype=torch.long)
-    dataset = TensorDataset(tokens_tensor, labels_tensor)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+def build_arg_parser():
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+    p = argparse.ArgumentParser(description="TinyLLM Pretraining")
+    # 模型参数
+    p.add_argument("--d_model", type=int, default=256)
+    p.add_argument("--n_head", type=int, default=8)
+    p.add_argument("--d_hidden", type=int, default=1024)
+    p.add_argument("--n_layer", type=int, default=4)
+    p.add_argument("--max_seq_len", type=int, default=2048)
+    # 训练参数
+    p.add_argument("--batch_size", type=int, default=8, help="B")
+    p.add_argument("--block_size", type=int, default=1024, help="T")
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--steps_per_epoch", type=int, default=100)
+    p.add_argument("--device", type=str, default=default_device)
+    # 数据参数
+    p.add_argument("--data_dir", type=str, default="./base_data")
+    p.add_argument("--encoding_name", type=str, default="cl100k_base")
+    p.add_argument("--tokenizer_threads", type=int, default=4)
+    p.add_argument("--tokenizer_batch_size", type=int, default=128)
+    return p
 
 
 def main():
-    # 准备一个小语料（示例）
-    corpus = [
-        "你好，世界！",
-        "今天天气不错。",
-        "大型语言模型很有趣。",
-        "Transformers 支持长上下文的自回归生成。",
-        "用 <eos> 作为段落边界，拼接后切分训练样本。",
-    ]
+    # 解析参数
+    args = build_arg_parser().parse_args()
 
-    # 构建 tokenizer 与 dataloader
-    tokenizer = CharTokenizer(corpus)
-    batch_size = 8
-    block_size = 64  # 每个训练样本的上下文长度（不含右移标签的最后一个 token）
-    dataloader = build_dataloader(corpus, tokenizer, block_size=block_size, batch_size=batch_size)
+    # 分布式信息，用于只在 rank 0 打印日志
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    # 实例化模型（确保 head_dim=d_model//n_head 为偶数）
-    d_model = 256
-    n_head = 8
-    d_hidden = 1024
-    n_layer = 4
-    max_seq_len = 2048
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = TransformerModel(d_model, n_head, d_hidden, n_layer, vocab_size=tokenizer.vocab_size, max_seq_len=max_seq_len)
-    model = model.to(device)
+    # 根据配置和 DDP 自动绑定设备（需与 data.py 的参数保持一致）
+    train_device_str = args.device
+    if ddp and train_device_str.startswith("cuda"):
+        train_device_str = f"cuda:{ddp_local_rank}"
+    device = torch.device(train_device_str)
 
-    # 优化器与损失（自回归，忽略索引可不设，因为无 pad）
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    # 词表大小取自 tiktoken 编码器
+    enc = tiktoken.get_encoding(args.encoding_name)
+    vocab_size = enc.n_vocab
+
+    # 检查 max_seq_len 与 block_size 的兼容性
+    if args.max_seq_len < args.block_size:
+        raise ValueError(f"max_seq_len({args.max_seq_len}) 应 >= block_size({args.block_size})")
+
+    # 实例化模型
+    model = TransformerModel(
+        d_model=args.d_model,
+        n_head=args.n_head,
+        d_hidden=args.d_hidden,
+        n_layer=args.n_layer,
+        vocab_size=vocab_size,
+        max_seq_len=args.max_seq_len,
+    ).to(device)
+
+    # 优化器与损失（自回归）
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = torch.nn.CrossEntropyLoss()
 
-    # 演示训练过程（1 个 epoch）
-    train(model, dataloader, optimizer, criterion, device, epochs=1)
+    # 预训练：每个 epoch 重新创建一次（有限）数据迭代器并完整遍历
+    for epoch in range(args.epochs):
+        batch_iter = tokenizing_distributed_data_loader(
+            B=args.batch_size,
+            T=args.block_size,
+            tokenizer_threads=args.tokenizer_threads,
+            tokenizer_batch_size=args.tokenizer_batch_size,
+            device=train_device_str,
+            data_dir=args.data_dir,
+            encoding_name=args.encoding_name,
+        )
+        train_one_epoch(
+            model,
+            batch_iter,
+            optimizer,
+            criterion,
+            device,
+        )
 
 
 if __name__ == '__main__':
     main()
-
-
