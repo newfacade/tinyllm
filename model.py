@@ -8,7 +8,7 @@ from normalization import RMSNorm
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, n_head):
+    def __init__(self, d_model, n_head, dropout=0.0):
         super().__init__()
         assert d_model % n_head == 0, "d_model 必须能整除 n_head"
         self.d_model = d_model
@@ -21,6 +21,7 @@ class MultiHeadAttention(nn.Module):
         self.wk = nn.Linear(d_model, n_head * head_dim, bias=False)
         self.wv = nn.Linear(d_model, n_head * head_dim, bias=False)
         self.wo = nn.Linear(n_head * head_dim, d_model, bias=False)
+        self.attn_dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, freq_cis: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -41,6 +42,8 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             scores = scores + mask
         attn = torch.softmax(scores, dim=-1)
+        # 1. Attention Dropout: 在 softmax 之后，乘 v 之前
+        attn = self.attn_dropout(attn)
         o = attn @ v
         # 合并头 [b, n_head, t, head_dim] -> [b, t, n_head * head_dim]
         o = o.transpose(1, 2).reshape(o.shape[0], -1, self.n_head * self.head_dim)
@@ -50,18 +53,19 @@ class MultiHeadAttention(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, d_model, d_hidden):
         super().__init__()
-        self.w1 = nn.Linear(d_model, d_hidden, bias=False)
-        self.w2 = nn.Linear(d_hidden, d_model, bias=False)
+        self.gate_proj = nn.Linear(d_model, d_hidden, bias=False)
+        self.up_proj = nn.Linear(d_model, d_hidden, bias=False)
+        self.down_proj = nn.Linear(d_hidden, d_model, bias=False)
 
     def forward(self, x: torch.Tensor):
         # [b, t, d_model] -> [b, t, d_hidden] -> [b, t, d_model]
-        return self.w2(torch.nn.functional.relu(self.w1(x)))
+        return self.down_proj(nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_head, d_hidden):
+    def __init__(self, d_model, n_head, d_hidden, dropout=0.0):
         super().__init__()
-        self.attn = MultiHeadAttention(d_model, n_head)
+        self.attn = MultiHeadAttention(d_model, n_head, dropout)
         self.ffn = FeedForward(d_model, d_hidden)
         self.norm1 = RMSNorm(d_model)
         self.norm2 = RMSNorm(d_model)
@@ -82,10 +86,10 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, d_model, n_head, d_hidden, n_layer, vocab_size, max_seq_len=8192, rope_theta=10000.0):
+    def __init__(self, d_model, n_head, d_hidden, n_layer, vocab_size, max_seq_len=8192, rope_theta=10000.0, dropout=0.0):
         super().__init__()
         self.embeddings = nn.Embedding(vocab_size, d_model)
-        self.layers = nn.ModuleList([TransformerBlock(d_model, n_head, d_hidden) for _ in range(n_layer)])
+        self.layers = nn.ModuleList([TransformerBlock(d_model, n_head, d_hidden, dropout) for _ in range(n_layer)])
         self.norm = RMSNorm(d_model)
         self.output = nn.Linear(d_model, vocab_size, bias=False)
         # RoPE 频率按 head_dim 计算，而不是 d_model

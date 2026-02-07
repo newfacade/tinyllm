@@ -1,7 +1,8 @@
 import torch
+from torch import nn
 
 
-class LayerNorm(torch.nn.Module):
+class LayerNorm(nn.Module):
     """
     简化版 LayerNorm：在张量的最后一维上进行归一化，并应用可学习的仿射变换。
     等价目标：与 `torch.nn.LayerNorm(normalized_shape=dim, eps=eps)` 的数值行为一致。
@@ -16,8 +17,8 @@ class LayerNorm(torch.nn.Module):
         super().__init__()
         self.eps = eps
         # 可学习的缩放和偏置参数，形状为 [dim]，按最后一维进行广播
-        self.weight = torch.nn.Parameter(torch.ones(dim))
-        self.bias = torch.nn.Parameter(torch.zeros(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
         # x 一般是三维张量，形状是 (batch_size, seq_len, d_model) ，LayerNorm在最后一维（d_model）上归一化
@@ -32,7 +33,7 @@ class LayerNorm(torch.nn.Module):
         return self.weight * x_hat + self.bias
 
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     """
     RMSNorm：仅通过均方根（Root Mean Square）进行归一化，不减均值。
 
@@ -51,10 +52,10 @@ class RMSNorm(torch.nn.Module):
     形状约定：
         输入 x 形状为 (..., dim)，在最后一维 dim 上归一化；weight 的形状为 [dim]，按最后一维广播。
     """
-    def __init__(self, dim, eps=1e-8):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
         # root mean square
